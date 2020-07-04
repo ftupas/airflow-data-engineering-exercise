@@ -1,0 +1,62 @@
+# Base Image
+FROM python:3.7-slim-stretch
+LABEL maintainer="fred"
+
+# Never prompts the user for choices on installation/configuration of packages
+ENV DEBIAN_FRONTEND noninteractive
+ENV TERM linux
+
+# Airflow
+ARG AIRFLOW_VERSION=1.10.9
+ARG AIRFLOW_HOME=/usr/local/airflow
+ENV AIRFLOW_HOME=${AIRFLOW_HOME}
+
+# Install dependencies and tools
+RUN apt-get update -yqq && \
+    apt-get upgrade -yqq && \
+    apt-get install -yqq --no-install-recommends \ 
+    wget \
+    libczmq-dev \
+    curl \
+    libssl-dev \
+    git \
+    inetutils-telnet \
+    bind9utils freetds-dev \
+    libkrb5-dev \
+    libsasl2-dev \
+    libffi-dev libpq-dev \
+    freetds-bin build-essential \
+    default-libmysqlclient-dev \
+    apt-utils \
+    rsync \
+    zip \
+    unzip \
+    gcc \
+    vim \
+    locales \
+    && apt-get clean
+
+# Upgrade pip
+# Create airflow user 
+# Install apache airflow with subpackages
+RUN pip install --upgrade pip && \
+    useradd -ms /bin/bash -d ${AIRFLOW_HOME} airflow && \
+    pip install websocket-client==0.54.0 && \
+    pip install apache-airflow[crypto,celery,postgres,hive,mysql,ssh,docker,hdfs,kubernetes]==${AIRFLOW_VERSION}
+
+# Fix because of wrong dependencies
+RUN pip install SQLAlchemy==1.3.15
+RUN pip install boto3
+
+# Copy files
+COPY scripts/entrypoint.sh /entrypoint.sh
+COPY config/airflow.cfg ${AIRFLOW_HOME}/airflow.cfg
+COPY airflow/dags ${AIRFLOW_HOME}/dags
+
+RUN chown -R airflow: ${AIRFLOW_HOME}
+
+EXPOSE 8080
+
+USER airflow
+WORKDIR ${AIRFLOW_HOME}
+ENTRYPOINT ["/entrypoint.sh"]
