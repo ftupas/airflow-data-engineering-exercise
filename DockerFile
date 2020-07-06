@@ -52,6 +52,7 @@ RUN pip install boto3
 COPY scripts/entrypoint.sh /entrypoint.sh
 COPY config/airflow.cfg ${AIRFLOW_HOME}/airflow.cfg
 COPY airflow/dags ${AIRFLOW_HOME}/dags
+COPY airflow/plugins ${AIRFLOW_HOME}/plugins
 
 RUN chown -R airflow: ${AIRFLOW_HOME}
 

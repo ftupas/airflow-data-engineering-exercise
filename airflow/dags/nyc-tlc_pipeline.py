@@ -1,179 +1,130 @@
+from operators import (CreateTablesOperator, S3ToRedshiftOperator, LoadDimensionOperator, LoadFactOperator, LoadCalcOperator)
+from helpers import SqlQueries
 from airflow import DAG
-from airflow.operators.python_operator import PythonOperator
-from airflow.operators.postgres_operator import PostgresOperator
-from airflow.hooks.postgres_hook import PostgresHook
-from airflow.hooks.S3_hook import S3Hook
-from airflow.contrib.hooks.aws_hook import AwsHook
-import sql_queries
-import datetime
-import logging
-import re
 
-default_args = {
-	"owner": "fred",
-	'depends_on_past': False,
-	"start_date": datetime.datetime(2019, 11, 1),
-	"end_date": datetime.datetime(2019, 12, 1)
+import datetime
+
+TAXI_REGEX = "^(trip data)/({})_tripdata_(\d\d\d\d)-(\d\d).csv"
+LOOKUP_REGEX = "^(misc)/(taxi _zone_lookup.csv)"
+
+S3_BUCKET = "nyc-tlc"
+S3_PREFIX = "trip data"
+S3_PREFIX_LOOKUP = "misc"
+
+REDSHIFT = "redshift"
+AWS_CREDENTIALS = "aws_credentials"
+
+DAG_DEFAULT_ARGS = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "start_date": datetime.datetime(2019, 11, 1),
+    "end_date": datetime.datetime(2019, 12, 1)
 }
 
-with DAG(dag_id = "nyc-tlc-pipeline",
-	default_args = default_args,
-	schedule_interval = "@monthly") as dag:
-
-	def copy_new_files(*args, **kwargs):
-		"""
-		Gets the files for the month
-		"""
-		# Get report month and date
-		ds = kwargs.get("ds")
-		report_date = datetime.datetime.strptime(ds, "%Y-%m-%d")
-		report_month = report_date.month
-		report_year = report_date.year
-		logging.info(f"Looking for files with month = {report_month} and year = {report_year}")
-
-		# Get list of files
-		hook = S3Hook(aws_conn_id = "aws_credentials")
-		bucket = "nyc-tlc"
-		prefix = "trip data"
-		logging.info(f"Listing Keys from {bucket}/{prefix}")
-		keys = hook.list_keys(bucket, prefix = prefix)
-
-		# Get list of new files
-		# regex = "^(trip data)/(\w+)_tripdata_(\d\d\d\d)-(\d\d).csv" all taxis
-		regex = "^(trip data)/(yellow)_tripdata_(\d\d\d\d)-(\d\d).csv"
-
-		new_files = []
-		tables = []
-		for key in keys:
-			match = re.search(regex, key)
-			if match:
-				taxi_type = match.group(2)
-				year = int(match.group(3))
-				month = int(match.group(4))
-
-				if report_year == year and report_month == month:
-					new_files.append(key)
-					tables.append(taxi_type)
-
-		# Copy new files
-		aws_hook = AwsHook("aws_credentials")
-		credentials = aws_hook.get_credentials()
-		redshift_hook = PostgresHook("redshift")
-		for table, file in zip(tables, new_files):
-			file.replace(" ", "+")
-			redshift_hook.run(sql_queries.COPY_TRIPS_SQL.format(
-				f"staging_{table}_trips",
-				f"s3://{bucket}/{file}",
-				credentials.access_key,
-				credentials.secret_key
-				))
-
-		logging.info(f"New files are {new_files}")
-
-	def load_trips_table():
-		"""
-		Loads the data from staging to trips
-		"""
-		ds = kwargs.get("ds")
-		report_date = datetime.datetime.strptime(ds, "%Y-%m-%d")
-		month = f"{report_date.year}-{report_date.month}"
-		hook = PostgresHook("redshift")
-		hook.run(sql_queries.LOAD_TRIPS)
-
-
-	def calc_pop_destination_passengers_month(*args, **kwargs):
-		"""
-		Computes for the top 5 popular destinations per pickup-zone in
-		terms of total passengers for the month and loads it to a table
-		"""
-		ds = kwargs.get("ds")
-		report_date = datetime.datetime.strptime(ds, "%Y-%m-%d")
-		month = f"{report_date.year}-{report_date.month}"
-		hook = PostgresHook("redshift")
-		hook.run(sql_queries.CALC_pop_destination_passengers_month.format(month))
-
-	def calc_pop_destination_rides_month(*args, **kwargs):
-		"""
-		Computes for the rank of popular destinations per pickup-borough
-		in terms of total rides for the month and loads it to a table
-		"""
-		ds = kwargs.get("ds")
-		report_date = datetime.datetime.strptime(ds, "%Y-%m-%d")
-		month = f"{report_date.year}-{report_date.month}"
-		hook = PostgresHook("redshift")
-		hook.run(sql_queries.CALC_pop_destination_rides_month.format(month))
-
-	def load_popular_rides_full(*args, **kwargs):
-		"""
-		Computes for the rank of popular destinations per pickup-borough
-		in terms of total rides for the month and loads it to a table
-		"""
-		ds = kwargs.get("ds")
-		report_date = datetime.datetime.strptime(ds, "%Y-%m-%d")
-		month = f"{report_date.year}-{report_date.month}"
-
-		prev_ds = kwargs.get("prev_ds")
-		prev_report_date = datetime.datetime.strptime(prev_ds, "%Y-%m-%d")
-		prev_month = f"{prev_report_date.year}-{prev_report_date.month}"
-
-		hook = PostgresHook("redshift")
-		hook.run(sql_queries.Load_popular_rides_full.format(month, prev_month))
-
-	def calc_current_pop_dest(*args, **kwargs):
-		"""
-		Computes the latest rankings of popular destinations for the month
-		and loads it to a table
-		"""
-		ds = kwargs.get("ds")
-		report_date = datetime.datetime.strptime(ds, "%Y-%m-%d")
-		month = f"{report_date.year}-{report_date.month}"
-		hook = PostgresHook("redshift")
-		hook.run(sql_queries.CALC_current_pop_dest.format(month))
-
-	copy_new_files_task = PythonOperator(
-		task_id = "copy_new_files",
-		python_callable = copy_new_files,
-		provide_context = True,
-		dag = dag
-		)
+with DAG(dag_id="nyc-tlc-pipeline",
+         default_args=DAG_DEFAULT_ARGS,
+         schedule_interval="@monthly",
+         max_active_runs=1
+         ) as dag:
 	
-	load_trips_task = PostgresOperator(
-		task_id = "load_trips_table",
+	start_operator = CreateTablesOperator(
+		task_id = "init_tables",
 		dag = dag,
-		postgres_conn_id = "redshift",
-		sql = sql_queries.LOAD_TRIPS
+		redshift_conn_id = REDSHIFT,
+		sql = SqlQueries.CREATE_TABLES
 		)
 
-	calc_pop_destination_passengers_month_task = PythonOperator(
+	yellow_to_redshift_task = S3ToRedshiftOperator(
+		task_id = "stage_yellow",
+		dag = dag,
+		aws_credentials = AWS_CREDENTIALS,
+		redshift_conn_id = REDSHIFT,
+		provide_context = True,
+		bucket = S3_BUCKET,
+		prefix = S3_PREFIX,
+		table = "staging_yellow_trips",
+		regex = TAXI_REGEX.format("yellow"),
+		sql = SqlQueries.COPY_S3_SQL
+		)
+
+	lookup_to_redshift_task = S3ToRedshiftOperator(
+		task_id = "stage_lookup",
+		dag = dag,
+		aws_credentials = AWS_CREDENTIALS,
+		redshift_conn_id = REDSHIFT,
+		bucket = S3_BUCKET,
+		prefix = S3_PREFIX_LOOKUP,
+		table = "staging_lookup_trips",
+		regex = LOOKUP_REGEX,
+		sql = SqlQueries.COPY_S3_SQL
+		)
+
+	load_dim_pickup_task = LoadDimensionOperator(
+		task_id = "load_dim_pickup",
+		dag = dag,
+		redshift_conn_id = REDSHIFT,
+		table = "DIM_pickup",
+		sql = SqlQueries.LOAD_DIM_PICKUP_SQL,
+		append = True
+		)
+
+	load_dim_dropoff_task = LoadDimensionOperator(
+		task_id = "load_dim_dropoff",
+		dag = dag,
+		redshift_conn_id = REDSHIFT,
+		table = "DIM_dropoff",
+		sql = SqlQueries.LOAD_DIM_DROPOFF_SQL,
+		append = True
+		)
+
+	load_fact_trips_task = LoadFactOperator(
+		task_id = "load_fact_trips",
+		dag = dag,
+		redshift_conn_id = REDSHIFT,
+		table = "FACT_trips",
+		sql = SqlQueries.LOAD_FACT_TRIPS
+		)
+
+	calc_pop_destination_passengers_month_task = LoadCalcOperator(
 		task_id = "calc_pop_destination_passengers_month",
 		dag = dag,
-		python_callable = calc_pop_destination_passengers_month,
-		provide_context = True
+		redshift_conn_id = REDSHIFT,
+		table = "pop_destination_passengers_month",
+		sql = SqlQueries.CALC_POP_DESTINATION_PASSENGERS_MONTH
 		)
 
-	calc_pop_destination_rides_month_task = PythonOperator(
+	calc_pop_destination_rides_month_task = LoadCalcOperator(
 		task_id = "calc_pop_destination_rides_month",
 		dag = dag,
-		python_callable = calc_pop_destination_rides_month,
-		provide_context = True
+		redshift_conn_id = REDSHIFT,
+		table = "pop_destination_rides_month",
+		sql = SqlQueries.CALC_POP_DESTINATION_RIDES_MONTH
 		)
 
-	load_popular_rides_full_task = PythonOperator(
-		task_id = "load_popular_rides_full",
+	calc_popular_rides_full_task = LoadCalcOperator(
+		task_id = "calc_popular_rides_full",
 		dag = dag,
-		python_callable = load_popular_rides_full,
-		provide_context = True
+		redshift_conn_id = REDSHIFT,
+		table = "popular_rides_full",
+		sql = SqlQueries.CALC_POPULAR_RIDES_FULL,
+		compare = True
 		)
 
-	calc_current_pop_dest_task = PythonOperator(
+	calc_current_pop_dest_task = LoadCalcOperator(
 		task_id = "calc_current_pop_dest",
 		dag = dag,
-		python_callable = calc_current_pop_dest,
-		provide_context = True
+		redshift_conn_id = REDSHIFT,
+		table = "cur_popular_dest",
+		sql = SqlQueries.CALC_CURRENT_POP_DEST,
+		append = False
 		)
 
-copy_new_files_task >> load_trips_task
-load_trips_task >> calc_pop_destination_passengers_month_task
-load_trips_task >> calc_pop_destination_rides_month_task
-load_trips_task	>> load_popular_rides_full_task
-load_trips_task >> calc_current_pop_dest_task
+# Declare dependencies
+start_operator >> [yellow_to_redshift_task, lookup_to_redshift_task]
+lookup_to_redshift_task >> [load_dim_pickup_task, load_dim_dropoff_task]
+yellow_to_redshift_task >> load_fact_trips_task
+[load_dim_pickup_task, load_dim_dropoff_task] >> load_fact_trips_task
+load_fact_trips_task >> [calc_pop_destination_passengers_month_task, 
+						 calc_pop_destination_rides_month_task, 
+						 calc_popular_rides_full_task,
+						 calc_current_pop_dest_task]
